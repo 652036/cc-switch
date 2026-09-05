@@ -103,6 +103,8 @@ pub struct ModelStats {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogFilters {
+    pub service_tier: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub app_type: Option<String>,
     pub provider_name: Option<String>,
     pub model: Option<String>,
@@ -125,6 +127,11 @@ pub struct PaginatedLogs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLogDetail {
+    #[serde(default)]
+    pub fast_pricing_unavailable: bool,
+    pub service_tier: Option<String>,
+    pub service_tier_source: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub request_id: String,
     pub provider_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,19 +167,23 @@ pub struct RequestLogDetail {
     pub pricing_model: Option<String>,
 }
 
-/// 把 26 列的查询结果映射为 `RequestLogDetail`。
+/// 把 29 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 26 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 29 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
 ///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
 ///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model, input_token_semantics`
+///  data_source, pricing_model, input_token_semantics, service_tier, service_tier_source, reasoning_effort`
 ///
 /// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
-    Ok(RequestLogDetail {
+    let mut detail = RequestLogDetail {
+        fast_pricing_unavailable: false,
+        service_tier: row.get(26)?,
+        service_tier_source: row.get(27)?,
+        reasoning_effort: row.get(28)?,
         request_id: row.get(0)?,
         provider_id: row.get(1)?,
         provider_name: row.get(2)?,
@@ -201,7 +212,30 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         data_source: row.get(23)?,
         pricing_model: row.get(24)?,
         input_token_semantics: row.get::<_, i64>(25)?,
-    })
+    };
+    let mut context = u64::from(detail.input_tokens);
+    if !crate::services::sql_helpers::is_cache_inclusive_app(&detail.app_type)
+        || detail.input_token_semantics == 2
+    {
+        context += u64::from(detail.cache_read_tokens) + u64::from(detail.cache_creation_tokens);
+    } else if detail.input_token_semantics == 0 {
+        context += u64::from(detail.cache_creation_tokens);
+    }
+    let model = detail
+        .pricing_model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&detail.model);
+    let fast = detail.service_tier.as_deref() == Some("fast")
+        || (detail.service_tier.as_deref() == Some("priority") && !model.starts_with("claude-"));
+    detail.fast_pricing_unavailable = fast
+        && crate::proxy::usage::fast_pricing::factors(
+            model,
+            detail.service_tier.as_deref(),
+            context,
+        )
+        .is_none();
+    Ok(detail)
 }
 
 /// SQL fragment: resolve provider_name with fallback for session-based entries.
@@ -984,7 +1018,7 @@ impl Database {
                     CAST((l.created_at - ?1) / ?3 AS INTEGER) as bucket_idx,
                     COUNT(*) as request_count,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
-                    COALESCE(SUM({fresh_input} + l.output_tokens), 0) as total_tokens,
+                    COALESCE(SUM({fresh_input} + l.output_tokens + l.cache_read_tokens + l.cache_creation_tokens), 0) as total_tokens,
                     COALESCE(SUM({fresh_input}), 0) as total_input_tokens,
                     COALESCE(SUM(l.output_tokens), 0) as total_output_tokens,
                     COALESCE(SUM(l.cache_creation_tokens), 0) as total_cache_creation_tokens,
@@ -1097,7 +1131,7 @@ impl Database {
                 date(l.created_at, 'unixepoch', 'localtime') as bucket_date,
                 COUNT(*) as request_count,
                 COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
-                COALESCE(SUM({fresh_input} + l.output_tokens), 0) as total_tokens,
+                COALESCE(SUM({fresh_input} + l.output_tokens + l.cache_read_tokens + l.cache_creation_tokens), 0) as total_tokens,
                 COALESCE(SUM({fresh_input}), 0) as total_input_tokens,
                 COALESCE(SUM(l.output_tokens), 0) as total_output_tokens,
                 COALESCE(SUM(l.cache_creation_tokens), 0) as total_cache_creation_tokens,
@@ -1180,7 +1214,7 @@ impl Database {
                 r.date,
                 COALESCE(SUM(r.request_count), 0),
                 COALESCE(SUM(CAST(r.total_cost_usd AS REAL)), 0),
-                COALESCE(SUM({fresh_input_rollup} + r.output_tokens), 0),
+                COALESCE(SUM({fresh_input_rollup} + r.output_tokens + r.cache_read_tokens + r.cache_creation_tokens), 0),
                 COALESCE(SUM({fresh_input_rollup}), 0),
                 COALESCE(SUM(r.output_tokens), 0),
                 COALESCE(SUM(r.cache_creation_tokens), 0),
@@ -1346,7 +1380,7 @@ impl Database {
                 SELECT l.provider_id, l.app_type,
                     {detail_pname} as provider_name,
                     COUNT(*) as request_count,
-                    COALESCE(SUM({fresh_input_detail} + l.output_tokens), 0) as total_tokens,
+                    COALESCE(SUM({fresh_input_detail} + l.output_tokens + l.cache_read_tokens + l.cache_creation_tokens), 0) as total_tokens,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
                     COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
                     COALESCE(SUM(l.latency_ms), 0) as latency_sum
@@ -1358,7 +1392,7 @@ impl Database {
                 SELECT r.provider_id, r.app_type,
                     {rollup_pname} as provider_name,
                     COALESCE(SUM(r.request_count), 0),
-                    COALESCE(SUM({fresh_input_rollup} + r.output_tokens), 0),
+                    COALESCE(SUM({fresh_input_rollup} + r.output_tokens + r.cache_read_tokens + r.cache_creation_tokens), 0),
                     COALESCE(SUM(CAST(r.total_cost_usd AS REAL)), 0),
                     COALESCE(SUM(r.success_count), 0),
                     COALESCE(SUM(r.avg_latency_ms * r.request_count), 0)
@@ -1500,7 +1534,7 @@ impl Database {
             FROM (
                 SELECT {detail_model} as model,
                     COUNT(*) as request_count,
-                    COALESCE(SUM({fresh_input_detail} + l.output_tokens), 0) as total_tokens,
+                    COALESCE(SUM({fresh_input_detail} + l.output_tokens + l.cache_read_tokens + l.cache_creation_tokens), 0) as total_tokens,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost
                 FROM proxy_request_logs l
                 {detail_join}
@@ -1509,7 +1543,7 @@ impl Database {
                 UNION ALL
                 SELECT {rollup_model},
                     COALESCE(SUM(r.request_count), 0),
-                    COALESCE(SUM({fresh_input_rollup} + r.output_tokens), 0),
+                    COALESCE(SUM({fresh_input_rollup} + r.output_tokens + r.cache_read_tokens + r.cache_creation_tokens), 0),
                     COALESCE(SUM(CAST(r.total_cost_usd AS REAL)), 0)
                 FROM usage_daily_rollups r
                 {rollup_join}
@@ -1580,6 +1614,21 @@ impl Database {
             filters.provider_name.as_deref(),
             filters.model.as_deref(),
         );
+        for (column, value) in [
+            ("l.service_tier", &filters.service_tier),
+            ("l.reasoning_effort", &filters.reasoning_effort),
+        ] {
+            if let Some(value) = value {
+                if value == "unknown" {
+                    conditions.push(format!("{column} IS NULL"));
+                } else if column == "l.service_tier" && value == "fast" {
+                    conditions.push("(l.service_tier = 'fast' OR (l.service_tier = 'priority' AND l.model NOT LIKE 'claude-%'))".to_string());
+                } else {
+                    conditions.push(format!("{column} = ?"));
+                    params.push(Box::new(value.clone()));
+                }
+            }
+        }
         if let Some(status) = filters.status_code {
             conditions.push("l.status_code = ?".to_string());
             params.push(Box::new(status as i64));
@@ -1623,7 +1672,7 @@ impl Database {
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics
+                    l.input_token_semantics, l.service_tier, l.service_tier_source, l.reasoning_effort
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1666,8 +1715,8 @@ impl Database {
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics
+                    status_code, error_message, l.created_at, l.data_source, l.pricing_model,
+                    l.input_token_semantics, l.service_tier, l.service_tier_source, l.reasoning_effort
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1823,7 +1872,7 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model, input_token_semantics
+                        data_source, pricing_model, input_token_semantics, service_tier, service_tier_source, reasoning_effort
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0
@@ -1934,6 +1983,36 @@ impl Database {
         let base_total = input_cost + output_cost + cache_read_cost + cache_creation_cost;
         let total_cost = base_total * multiplier;
 
+        let mut cost = crate::proxy::usage::calculator::CostBreakdown {
+            input_cost,
+            output_cost,
+            cache_read_cost,
+            cache_creation_cost,
+            total_cost,
+        };
+        let context_tokens = billable_input_tokens
+            + u64::from(log.cache_read_tokens)
+            + u64::from(log.cache_creation_tokens);
+        let pricing_model = log
+            .pricing_model
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&log.model);
+        if let Some(factors) = crate::proxy::usage::fast_pricing::factors(
+            pricing_model,
+            log.service_tier.as_deref(),
+            context_tokens,
+        ) {
+            crate::proxy::usage::fast_pricing::apply(&mut cost, factors, multiplier);
+        }
+        let crate::proxy::usage::calculator::CostBreakdown {
+            input_cost,
+            output_cost,
+            cache_read_cost,
+            cache_creation_cost,
+            total_cost,
+        } = cost;
+
         log.input_cost_usd = format!("{input_cost:.6}");
         log.output_cost_usd = format!("{output_cost:.6}");
         log.cache_read_cost_usd = format!("{cache_read_cost:.6}");
@@ -1946,7 +2025,8 @@ impl Database {
                  output_cost_usd = ?2,
                  cache_read_cost_usd = ?3,
                  cache_creation_cost_usd = ?4,
-                 total_cost_usd = ?5
+                 total_cost_usd = ?5,
+                 service_tier_pricing_version = 1
              WHERE request_id = ?6",
             params![
                 log.input_cost_usd,
@@ -2366,6 +2446,73 @@ fn should_try_pricing_prefix_match(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_filters_share_count_pagination_and_detail_values() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            for (i, tier, effort) in [
+                (0, Some("priority"), Some("high")),
+                (1, Some("fast"), Some("high")),
+                (2, Some("default"), Some("low")),
+                (3, None, None),
+            ] {
+                let id = format!("metadata-{i}");
+                insert_usage_log(
+                    &conn,
+                    &id,
+                    "codex",
+                    "_codex_session",
+                    "gpt-5.6-sol",
+                    "codex_session",
+                    1700000000 + i,
+                    100,
+                    10,
+                    0,
+                    0,
+                    200,
+                    "0.5",
+                )?;
+                conn.execute("UPDATE proxy_request_logs SET service_tier=?2, service_tier_source=CASE WHEN ?2 IS NOT NULL THEN 'request' END, reasoning_effort=?3 WHERE request_id=?1", rusqlite::params![id, tier, effort])?;
+            }
+        }
+        let filters = LogFilters {
+            service_tier: Some("fast".into()),
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        let first = db.get_request_logs(&filters, 0, 1)?;
+        let second = db.get_request_logs(&filters, 1, 1)?;
+        assert_eq!((first.total, second.total), (2, 2));
+        assert_eq!((first.data.len(), second.data.len()), (1, 1));
+        assert_ne!(first.data[0].request_id, second.data[0].request_id);
+        let detail = db.get_request_detail(&first.data[0].request_id)?.unwrap();
+        assert_eq!(detail.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(detail.service_tier_source.as_deref(), Some("request"));
+        assert_eq!(detail.total_cost_usd, "0.5");
+        let unknown = db.get_request_logs(
+            &LogFilters {
+                service_tier: Some("unknown".into()),
+                reasoning_effort: Some("unknown".into()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+        assert_eq!(unknown.total, 1);
+        assert_eq!(unknown.data[0].request_id, "metadata-3");
+        let injected = db.get_request_logs(
+            &LogFilters {
+                service_tier: Some("' OR 1=1 --".into()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+        assert_eq!(injected.total, 0);
+        Ok(())
+    }
 
     fn local_ts(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
         match Local.with_ymd_and_hms(year, month, day, hour, minute, second) {
@@ -3775,6 +3922,61 @@ mod tests {
         assert!(request_ids.contains(&"session-matches-error-proxy"));
         assert!(request_ids.contains(&"claude-session-cache-creation-mismatch"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn totals_include_cache_once_across_detail_and_rollup_semantics() -> Result<(), AppError> {
+        for (app, semantics, input) in [
+            ("claude", INPUT_TOKEN_SEMANTICS_FRESH, 100),
+            ("codex", 0, 160),
+            ("codex", INPUT_TOKEN_SEMANTICS_TOTAL, 180),
+            ("codex", INPUT_TOKEN_SEMANTICS_FRESH, 100),
+            ("gemini", INPUT_TOKEN_SEMANTICS_TOTAL, 180),
+            ("grokbuild", INPUT_TOKEN_SEMANTICS_TOTAL, 180),
+        ] {
+            let db = Database::memory()?;
+            let start = local_ts(2024, 3, 1, 0, 0, 0);
+            let event_time = local_ts(2024, 3, 2, 12, 0, 0);
+            let end = local_ts(2024, 3, 4, 0, 0, 0);
+            {
+                let conn = lock_conn!(db.conn);
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model, input_token_semantics,
+                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        total_cost_usd, latency_ms, status_code, created_at
+                    ) VALUES ('cache-detail', 'p1', ?1, 'test-model', ?2, ?3, 30, 60, 20, '0.25', 100, 200, ?4)",
+                    params![app, semantics, input, event_time],
+                )?;
+                conn.execute(
+                    "INSERT INTO usage_daily_rollups (
+                        date, app_type, provider_id, model, input_token_semantics,
+                        request_count, success_count, input_tokens, output_tokens,
+                        cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms
+                    ) VALUES ('2024-03-01', ?1, 'p1', 'test-model', ?2, 1, 1, 100, 30, 60, 20, '0.25', 100)",
+                    params![app, INPUT_TOKEN_SEMANTICS_FRESH],
+                )?;
+            }
+            // Each record has 100 fresh + 60 cache read + 20 cache write + 30 output.
+            let models = db.get_model_stats(Some(start), Some(end), Some(app), None, None)?;
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].total_tokens, 420, "{app}/{semantics}");
+            assert_eq!(models[0].request_count, 2);
+            assert_eq!(models[0].total_cost, "0.500000");
+            let providers = db.get_provider_stats(Some(start), Some(end), Some(app), None, None)?;
+            assert_eq!(providers[0].total_tokens, 420, "{app}/{semantics}");
+            let daily = db.get_daily_trends(Some(start), Some(end), Some(app), None, None)?;
+            assert_eq!(daily.iter().map(|r| r.total_tokens).sum::<u64>(), 420);
+            let hourly = db.get_daily_trends(
+                Some(event_time - 3600),
+                Some(event_time + 3600),
+                Some(app),
+                None,
+                None,
+            )?;
+            assert_eq!(hourly.iter().map(|r| r.total_tokens).sum::<u64>(), 210);
+        }
         Ok(())
     }
 

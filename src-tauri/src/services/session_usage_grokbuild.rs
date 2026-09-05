@@ -552,7 +552,7 @@ fn insert_grok_session_entry(
             cache_read_cost,
             cache_creation_cost,
             total_cost,
-            turn.api_ms.min(i64::MAX as u64) as i64, // latency_ms（本轮 API 时长）
+            0i64,                // latency_ms: 会话日志无可靠延迟数据，对齐 Claude/Codex
             Option::<i64>::None, // first_token_ms
             200i64,              // status_code
             Option::<String>::None, // error_message
