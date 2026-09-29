@@ -202,16 +202,15 @@ fn schema_migration_sets_user_version_when_missing() {
 }
 
 #[test]
-fn schema_migration_rejects_future_version() {
+fn schema_migration_tolerates_future_version() {
     let conn = Connection::open_in_memory().expect("open memory db");
     Database::create_tables_on_conn(&conn).expect("create tables");
     Database::set_user_version(&conn, SCHEMA_VERSION + 1).expect("set future version");
 
-    let err =
-        Database::apply_schema_migrations_on_conn(&conn).expect_err("should reject higher version");
-    assert!(
-        err.to_string().contains("数据库版本过新"),
-        "unexpected error: {err}"
+    Database::apply_schema_migrations_on_conn(&conn).expect("should skip migration");
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version"),
+        SCHEMA_VERSION + 1
     );
 }
 
@@ -832,6 +831,100 @@ fn schema_model_pricing_is_seeded_on_init() {
 }
 
 #[test]
+fn model_pricing_refresh_converges_from_old_defaults_and_preserves_overrides() {
+    let db = Database::memory().expect("create memory db");
+    // Include pre-cache-write Terra/Luna defaults: their historical repairs used
+    // to leave an intermediate price until the following application startup.
+    let cases = [
+        (
+            "gpt-5.6-sol",
+            ["5", "30", "0.50", "0"],
+            ["4", "20", "0.40", "5"],
+        ),
+        (
+            "gpt-5.6-high",
+            ["5", "30", "0.50", "6.25"],
+            ["4", "20", "0.40", "5"],
+        ),
+        (
+            "gpt-5.6-terra",
+            ["2.50", "15", "0.25", "0"],
+            ["2", "12", "0.20", "2.50"],
+        ),
+        (
+            "gpt-5.6-luna",
+            ["1", "6", "0.10", "0"],
+            ["0.20", "1.20", "0.02", "0.25"],
+        ),
+        (
+            "gemini-3.6-flash",
+            ["1.50", "7.50", "0.15", "0"],
+            ["0.75", "3.75", "0.075", "0"],
+        ),
+        (
+            "minimax-m2.5",
+            ["0.15", "0.95", "0.03", "0"],
+            ["0.30", "1.20", "0.03", "0.375"],
+        ),
+        (
+            "qwen3.6-plus",
+            ["0.325", "1.95", "0.065", "0"],
+            ["0.50", "3", "0.05", "0.625"],
+        ),
+        (
+            "mistral-small-4",
+            ["0.10", "0.30", "0.01", "0"],
+            ["0.15", "0.60", "0.015", "0"],
+        ),
+    ];
+    {
+        let conn = db.conn.lock().unwrap();
+        for (model, old, _) in cases {
+            conn.execute(
+                "UPDATE model_pricing SET input_cost_per_million=?2, output_cost_per_million=?3,
+                 cache_read_cost_per_million=?4, cache_creation_cost_per_million=?5 WHERE model_id=?1",
+                rusqlite::params![model, old[0], old[1], old[2], old[3]],
+            ).unwrap();
+        }
+        // Changing just one field must protect the entire custom price row.
+        conn.execute(
+            "UPDATE model_pricing SET input_cost_per_million='5', output_cost_per_million='31',
+             cache_read_cost_per_million='0.50', cache_creation_cost_per_million='6.25'
+             WHERE model_id='gpt-5.6'",
+            [],
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        db.ensure_model_pricing_seeded().unwrap();
+        let conn = db.conn.lock().unwrap();
+        for (model, _, expected) in cases.into_iter().chain([
+            ("gpt-5.6", [""; 4], ["5", "31", "0.50", "6.25"]),
+            ("gpt-6-astra", [""; 4], ["10", "50", "1", "12.50"]),
+            ("gemini-3.8-flash", [""; 4], ["0.75", "3.75", "0.075", "0"]),
+            ("glm-5.3", [""; 4], ["1.4", "4.4", "0.26", "0"]),
+            (
+                "deepseek-v4-pro-0813",
+                [""; 4],
+                ["1.32", "3.96", "0.044", "0"],
+            ),
+            ("codex-mini-latest", [""; 4], ["1.50", "6", "0.375", "0"]),
+        ]) {
+            let actual: [String; 4] = conn
+                .query_row(
+                    "SELECT input_cost_per_million, output_cost_per_million,
+                 cache_read_cost_per_million, cache_creation_cost_per_million
+                 FROM model_pricing WHERE model_id=?1",
+                    [model],
+                    |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "{model}");
+        }
+    }
+}
+
+#[test]
 fn model_pricing_seed_repairs_known_outdated_builtin_prices() {
     let db = Database::memory().expect("create memory db");
 
@@ -890,6 +983,135 @@ fn model_pricing_seed_repairs_known_outdated_builtin_prices() {
         )
         .expect("query GLM price");
     assert_eq!(glm, ("9".to_string(), "9".to_string(), "9".to_string()));
+}
+
+#[test]
+fn model_pricing_seed_includes_claude_5_1_and_standard_sonnet_5_prices() {
+    let db = Database::memory().expect("create memory db");
+    let conn = db.conn.lock().expect("lock conn");
+
+    for model_id in ["claude-fable-5-1", "claude-mythos-5-1"] {
+        let price: (String, String, String, String) = conn
+            .query_row(
+                "SELECT input_cost_per_million, output_cost_per_million,
+                        cache_read_cost_per_million, cache_creation_cost_per_million
+                 FROM model_pricing WHERE model_id = ?1",
+                [model_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query Fable 5.1 family price");
+        // 缓存读 0.025x = $0.25，不是 Fable 5 的 $1
+        assert_eq!(
+            price,
+            (
+                "10".to_string(),
+                "50".to_string(),
+                "0.25".to_string(),
+                "12.50".to_string(),
+            ),
+            "{model_id}"
+        );
+    }
+
+    let sonnet: (String, String, String, String) = conn
+        .query_row(
+            "SELECT input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+             FROM model_pricing WHERE model_id = 'claude-sonnet-5'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query Sonnet 5 price");
+    // $2/$10 介绍价已转为正式价（原定 2026-09-01 涨至 $3/$15 取消）
+    assert_eq!(
+        sonnet,
+        (
+            "2".to_string(),
+            "10".to_string(),
+            "0.20".to_string(),
+            "2.50".to_string(),
+        )
+    );
+}
+
+#[test]
+fn model_pricing_seed_repairs_sonnet_5_list_price_but_keeps_custom_price() {
+    let db = Database::memory().expect("create memory db");
+
+    {
+        let conn = db.conn.lock().expect("lock conn");
+        // 旧 seed 按 list 价录入的行 → 应被修正
+        conn.execute(
+            "UPDATE model_pricing
+             SET input_cost_per_million = '3',
+                 output_cost_per_million = '15',
+                 cache_read_cost_per_million = '0.30',
+                 cache_creation_cost_per_million = '3.75'
+             WHERE model_id = 'claude-sonnet-5'",
+            [],
+        )
+        .expect("restore old Sonnet 5 list price");
+    }
+
+    db.ensure_model_pricing_seeded()
+        .expect("ensure pricing seeded");
+
+    {
+        let conn = db.conn.lock().expect("lock conn");
+        let sonnet: (String, String, String, String) = conn
+            .query_row(
+                "SELECT input_cost_per_million, output_cost_per_million,
+                        cache_read_cost_per_million, cache_creation_cost_per_million
+                 FROM model_pricing WHERE model_id = 'claude-sonnet-5'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query repaired Sonnet 5 price");
+        assert_eq!(
+            sonnet,
+            (
+                "2".to_string(),
+                "10".to_string(),
+                "0.20".to_string(),
+                "2.50".to_string(),
+            )
+        );
+
+        // 用户手改过的价（不匹配旧 seed 值）不动
+        conn.execute(
+            "UPDATE model_pricing
+             SET input_cost_per_million = '9',
+                 output_cost_per_million = '9',
+                 cache_read_cost_per_million = '9',
+                 cache_creation_cost_per_million = '9'
+             WHERE model_id = 'claude-sonnet-5'",
+            [],
+        )
+        .expect("set custom Sonnet 5 price");
+    }
+
+    db.ensure_model_pricing_seeded()
+        .expect("ensure pricing seeded again");
+
+    let conn = db.conn.lock().expect("lock conn");
+    let custom: (String, String, String, String) = conn
+        .query_row(
+            "SELECT input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+             FROM model_pricing WHERE model_id = 'claude-sonnet-5'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query custom Sonnet 5 price");
+    assert_eq!(
+        custom,
+        (
+            "9".to_string(),
+            "9".to_string(),
+            "9".to_string(),
+            "9".to_string(),
+        )
+    );
 }
 
 #[test]

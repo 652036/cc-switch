@@ -53,7 +53,7 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 17;
+pub(crate) const SCHEMA_VERSION: i32 = 20;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -140,6 +140,12 @@ impl Database {
         }
 
         db.apply_schema_migrations()?;
+        {
+            let conn = lock_conn!(db.conn);
+            let tx = conn.unchecked_transaction()?;
+            crate::proxy::usage::fast_pricing::repair(&tx, None)?;
+            tx.commit()?;
+        }
         if let Err(e) = db.ensure_incremental_auto_vacuum() {
             log::warn!("Failed to ensure incremental auto-vacuum: {e}");
         }
@@ -164,22 +170,6 @@ impl Database {
         }
 
         Ok(db)
-    }
-
-    /// 读取磁盘上数据库的 `user_version`；仅当它比应用支持的 [`SCHEMA_VERSION`]
-    /// 更新时返回 `Some(version)`。
-    ///
-    /// 用于初始化失败后判断是否为「数据库版本过新（应用过旧，需升级应用）」的可恢复
-    /// 场景——此时不应反复弹出无效的重试对话框，而应引导用户在应用内升级。
-    pub fn stored_user_version_exceeds_supported(
-        db_path: &std::path::Path,
-    ) -> Result<Option<i32>, AppError> {
-        if !db_path.exists() {
-            return Ok(None);
-        }
-        let conn = Connection::open(db_path).map_err(|e| AppError::Database(e.to_string()))?;
-        let version = Self::get_user_version(&conn)?;
-        Ok((version > SCHEMA_VERSION).then_some(version))
     }
 
     /// 创建内存数据库（用于测试）

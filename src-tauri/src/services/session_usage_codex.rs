@@ -9,7 +9,7 @@
 //! ```
 //!
 //! ## 解析的事件类型
-//! - `session_meta` → 提取唯一 thread_id（子代理的 session_id 指向父线程）
+//! - `session_meta` → 提取自身 thread_id，以及父线程的重放去重关系
 //! - `turn_context` → 提取当前 model
 //! - `event_msg` (type=token_count) → 提取累计 token 用量，计算 delta
 
@@ -17,6 +17,7 @@ use crate::codex_config::get_codex_config_dir;
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
+use crate::proxy::usage::metadata::UsageMetadata;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, update_sync_state_on_conn, SessionSyncResult,
@@ -191,6 +192,7 @@ struct CachedReplayPrefix {
 
 #[derive(Debug)]
 struct ParsedTokenEvent {
+    metadata: UsageMetadata,
     line_offset: i64,
     signature: TokenUsageSignature,
     delta: DeltaTokens,
@@ -209,6 +211,9 @@ enum ParentResolution {
 #[derive(Debug)]
 struct ParsedCodexFile {
     root_thread_id: Option<String>,
+    /// root `session_meta` 的线程 ID（稳定逻辑线程）：单段文件名与文件名
+    /// UUID 一致，revert/resume 的双段文件名对应前置 UUID。
+    meta_thread_id: Option<String>,
     root_meta_seen: bool,
     root_timestamp: Option<DateTime<Utc>>,
     parent: ParentResolution,
@@ -397,6 +402,26 @@ fn thread_id_from_filename(path: &Path) -> Option<String> {
         .map(|value| value.hyphenated().to_string())
 }
 
+/// 双段文件名（`rollout-…-<threadId>_<rolloutId>.jsonl`）里下划线前的线程
+/// 本体 UUID；单段文件名返回 `None`。
+///
+/// `thread/revert` 为同一线程新建替换 rollout 时产生这种文件名（见
+/// openai/codex#38127）：末段是新生成的 rollout ID，其后的 resume 继续
+/// 向该文件追加。root meta 的 `id` 始终是原线程 ID，一致性校验需同时
+/// 接受两个 UUID。
+fn leading_thread_id_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let len = stem.len();
+    // 布局尾部：…<uuidA>_<uuidB>。uuidB 占 36 字符，其前是 '_'（共 37）
+    if !stem.get(len.checked_sub(37)?..)?.starts_with('_') {
+        return None;
+    }
+    let candidate = stem.get(len.checked_sub(73)?..len.checked_sub(37)?)?;
+    uuid::Uuid::parse_str(candidate)
+        .ok()
+        .map(|value| value.hyphenated().to_string())
+}
+
 fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
     let forked_from = non_empty_string(payload.get("forked_from_id"));
     let spawned_from = payload
@@ -470,6 +495,8 @@ fn token_snapshot_source(payload: &serde_json::Value) -> Option<String> {
 ///   仍用旧价，下一个同步 pass 生效。
 struct CodexSyncPass {
     cursors: HashMap<String, (i64, i64)>,
+    file_sizes: HashMap<String, Option<i64>>,
+    metadata_versions: HashMap<String, i64>,
     pricing: HashMap<String, Option<ModelPricing>>,
 }
 
@@ -477,19 +504,32 @@ impl CodexSyncPass {
     fn load(db: &Database) -> Result<Self, AppError> {
         let conn = lock_conn!(db.conn);
         let mut stmt = conn
-            .prepare("SELECT file_path, last_modified, last_line_offset FROM session_log_sync")
+            .prepare("SELECT file_path, last_modified, last_line_offset, last_byte_offset, codex_metadata_version FROM session_log_sync")
             .map_err(|e| AppError::Database(format!("预载同步游标失败: {e}")))?;
-        let cursors = stmt
+        let rows = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
-            .and_then(|rows| rows.collect::<Result<HashMap<_, _>, _>>())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
             .map_err(|e| AppError::Database(format!("预载同步游标失败: {e}")))?;
         Ok(Self {
-            cursors,
+            cursors: rows
+                .iter()
+                .map(|(path, cursor, _, _)| (path.clone(), *cursor))
+                .collect(),
+            metadata_versions: rows
+                .iter()
+                .map(|(path, _, _, version)| (path.clone(), *version))
+                .collect(),
+            file_sizes: rows
+                .into_iter()
+                .map(|(path, _, size, _)| (path, size))
+                .collect(),
             pricing: HashMap::new(),
         })
     }
@@ -728,7 +768,15 @@ fn build_rollout_index(files: &[PathBuf]) -> RolloutIndex {
     let mut index = RolloutIndex::new();
     for path in files {
         if let Some(thread_id) = thread_id_from_filename(path) {
-            index.entry(thread_id).or_default().push(path.clone());
+            index
+                .entry(thread_id.clone())
+                .or_default()
+                .push(path.clone());
+            if let Some(logical_id) =
+                leading_thread_id_from_filename(path).filter(|id| id != &thread_id)
+            {
+                index.entry(logical_id).or_default().push(path.clone());
+            }
         }
     }
     for paths in index.values_mut() {
@@ -763,8 +811,10 @@ fn parse_codex_file(
     let reader = BufReader::new(file);
     let mut root_meta_seen = false;
     let mut root_timestamp = None;
+    let mut meta_thread_id = None;
     let mut parent = ParentResolution::None;
     let mut current_model = "unknown".to_string();
+    let mut current_metadata = UsageMetadata::default();
     // `total_token_usage` is session-cumulative, including across model and
     // rate-limit bucket changes. Divergent snapshots are handled by preferring
     // exact `last_token_usage`, not by splitting the cumulative baseline.
@@ -797,7 +847,10 @@ fn parse_codex_file(
         if !is_event_msg && !is_turn_context && !is_session_meta {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") {
+        if is_event_msg
+            && !line.contains("\"token_count\"")
+            && !line.contains("\"thread_settings_applied\"")
+        {
             continue;
         }
 
@@ -816,14 +869,24 @@ fn parse_codex_file(
                 let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
                 parent = explicit_parent_from_meta(payload);
 
-                let meta_thread_id = non_empty_string(
+                meta_thread_id = non_empty_string(
                     payload
                         .get("id")
                         .or_else(|| payload.get("thread_id"))
                         .or_else(|| payload.get("threadId")),
-                );
-                if let (Some(filename_id), Some(meta_id)) = (&root_thread_id, meta_thread_id) {
-                    if filename_id != &meta_id {
+                )
+                .map(|id| {
+                    uuid::Uuid::parse_str(&id)
+                        .map(|value| value.hyphenated().to_string())
+                        .unwrap_or(id)
+                });
+                if let (Some(filename_id), Some(meta_id)) =
+                    (&root_thread_id, meta_thread_id.as_ref())
+                {
+                    let leading_id = leading_thread_id_from_filename(file_path);
+                    let matches =
+                        filename_id == meta_id || leading_id.as_deref() == Some(meta_id.as_str());
+                    if !matches {
                         parent = ParentResolution::Deferred(format!(
                             "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
                         ));
@@ -849,6 +912,12 @@ fn parse_codex_file(
             }
             "turn_context" => {
                 if let Some(payload) = value.get("payload") {
+                    let context = UsageMetadata::from_request(payload);
+                    current_metadata.reasoning_effort = context.reasoning_effort;
+                    if payload.get("service_tier").is_some() {
+                        current_metadata.service_tier = context.service_tier;
+                        current_metadata.service_tier_source = context.service_tier_source;
+                    }
                     if let Some(model) = payload
                         .get("model")
                         .or_else(|| payload.get("info").and_then(|info| info.get("model")))
@@ -862,6 +931,19 @@ fn parse_codex_file(
                 let Some(payload) = value.get("payload") else {
                     continue;
                 };
+                if payload.get("type").and_then(serde_json::Value::as_str)
+                    == Some("thread_settings_applied")
+                {
+                    let thread_id = payload.get("thread_id").and_then(serde_json::Value::as_str);
+                    if thread_id.is_some()
+                        && thread_id == meta_thread_id.as_deref().or(root_thread_id.as_deref())
+                    {
+                        if let Some(settings) = payload.get("thread_settings") {
+                            current_metadata = UsageMetadata::from_request(settings);
+                        }
+                    }
+                    continue;
+                }
                 if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
                     continue;
                 }
@@ -940,6 +1022,7 @@ fn parse_codex_file(
                 };
 
                 token_events.push(ParsedTokenEvent {
+                    metadata: current_metadata.clone(),
                     line_offset,
                     signature,
                     delta,
@@ -957,6 +1040,7 @@ fn parse_codex_file(
 
     Ok(ParsedCodexFile {
         root_thread_id,
+        meta_thread_id,
         root_meta_seen,
         root_timestamp,
         parent,
@@ -966,10 +1050,15 @@ fn parse_codex_file(
     })
 }
 
+#[cfg(test)]
 fn parent_signatures_before(
     parent_path: &Path,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<TokenUsageSignature>, String> {
+    load_parent_timeline(parent_path)?.signatures_before(parent_path, cutoff)
+}
+
+fn load_parent_timeline(parent_path: &Path) -> Result<Arc<ParentTokenTimeline>, String> {
     let file = fs::File::open(parent_path)
         .map_err(|error| format!("无法打开父 rollout {}: {error}", parent_path.display()))?;
     let stamp = ParentFileStamp::from_file(&file);
@@ -983,7 +1072,7 @@ fn parent_signatures_before(
         })
     });
     if let Some(timeline) = cached_timeline {
-        return timeline.signatures_before(parent_path, cutoff);
+        return Ok(timeline);
     }
 
     let mut events = Vec::new();
@@ -1037,7 +1126,6 @@ fn parent_signatures_before(
         max_timestamp,
         has_token_without_timestamp,
     });
-    let result = timeline.signatures_before(parent_path, cutoff);
     if let (Some(stamp), Ok(mut caches)) = (stamp, replay_caches().lock()) {
         caches.parent_timelines.insert(
             parent_path.to_path_buf(),
@@ -1047,7 +1135,7 @@ fn parent_signatures_before(
             },
         );
     }
-    result
+    Ok(timeline)
 }
 
 fn resolve_parent_signatures(
@@ -1061,10 +1149,22 @@ fn resolve_parent_signatures(
 
     let mut snapshots = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        snapshots.push(parent_signatures_before(candidate, cutoff)?);
+        let timeline = load_parent_timeline(candidate)?;
+        // A resumed logical thread can have an old, closed rollout alongside
+        // its replacement. Only histories that reach this child's creation
+        // time can establish its replay prefix. Keep ambiguity checks across
+        // all eligible histories rather than choosing by filename order.
+        if !timeline.has_token_without_timestamp
+            && timeline
+                .max_timestamp
+                .is_none_or(|timestamp| timestamp < cutoff)
+        {
+            continue;
+        }
+        snapshots.push(timeline.signatures_before(candidate, cutoff)?);
     }
     let Some(first) = snapshots.first() else {
-        return Err(format!("找不到父 rollout: {parent_id}"));
+        return Err(format!("父 rollout {parent_id} 尚未写到 child fork 时刻"));
     };
     if snapshots.iter().skip(1).any(|snapshot| snapshot != first) {
         return Err(format!(
@@ -1147,8 +1247,18 @@ fn sync_single_codex_file(
     // 检查同步状态
     let (last_modified, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
 
-    // 文件未变化则跳过
-    if file_modified <= last_modified {
+    // Windows can leave mtime unchanged while a writer keeps the file open.
+    // Legacy cursors have no byte count and must be rescanned once.
+    let backfill_metadata = pass
+        .metadata_versions
+        .get(&file_path_str)
+        .copied()
+        .unwrap_or(0)
+        < 1;
+    if !backfill_metadata
+        && file_modified == last_modified
+        && pass.file_sizes.get(&file_path_str).copied().flatten() == i64::try_from(file_size).ok()
+    {
         return Ok(CodexFileSyncResult::default());
     }
 
@@ -1181,7 +1291,14 @@ fn sync_single_codex_file(
 
     let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
     if !parsed.has_billable_tokens {
-        update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        let conn = lock_conn!(db.conn);
+        update_codex_sync_state(
+            &conn,
+            &file_path_str,
+            file_modified,
+            parsed.line_offset,
+            file_size,
+        )?;
         return Ok(CodexFileSyncResult::default());
     }
     let Some(root_thread_id) = parsed.root_thread_id.as_deref() else {
@@ -1286,7 +1403,7 @@ fn sync_single_codex_file(
             }
             continue;
         }
-        if event.line_offset <= last_offset {
+        if event.line_offset <= last_offset && !backfill_metadata {
             continue;
         }
         to_insert.push((event, event_index));
@@ -1296,6 +1413,12 @@ fn sync_single_codex_file(
     // journal 建立/fsync/删除）是全量重导的最大耗时项。批内单条插入失败
     // 沿用旧行为跳过该条继续；某批 commit 失败则该批整体回滚且游标不推进，
     // 下一 pass 重扫时由 request_id 主键 + 指纹去重兜底，不会双算。
+    //
+    // session_id 记 root meta 的线程 ID：双段文件名（thread/revert 的替换
+    // rollout）下是前置 UUID，与会话管理器侧的会话身份同口径；尾部 rollout
+    // ID 只承担 request_id 去重键（event_index 按物理文件计数，不能改用
+    // 前置 ID）。
+    let session_thread_id = parsed.meta_thread_id.as_deref().unwrap_or(root_thread_id);
     let batch_count = to_insert.len().div_ceil(CODEX_INSERT_BATCH_SIZE);
     for (batch_index, batch) in to_insert.chunks(CODEX_INSERT_BATCH_SIZE).enumerate() {
         let is_last_batch = batch_index + 1 == batch_count;
@@ -1310,28 +1433,42 @@ fn sync_single_codex_file(
         for (event, event_index) in batch {
             let request_id =
                 format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
-            match insert_codex_session_entry_on_conn(
-                &tx,
-                &request_id,
-                &event.delta,
-                &event.model,
-                Some(root_thread_id),
-                event.timestamp.as_deref(),
-                &mut batch_suspected,
-                &mut pass.pricing,
-            ) {
-                Ok(true) => batch_imported += 1,
-                Ok(false) => batch_skipped += 1,
-                Err(e) => {
-                    log::warn!("[CODEX-SYNC] 插入失败 ({request_id}): {e}");
-                    batch_skipped += 1;
+            if event.line_offset > last_offset {
+                match insert_codex_session_entry_on_conn(
+                    &tx,
+                    &request_id,
+                    &event.delta,
+                    &event.model,
+                    Some(session_thread_id),
+                    event.timestamp.as_deref(),
+                    &mut batch_suspected,
+                    &mut pass.pricing,
+                ) {
+                    Ok(true) => batch_imported += 1,
+                    Ok(false) => batch_skipped += 1,
+                    Err(e) => {
+                        log::warn!("[CODEX-SYNC] 插入失败 ({request_id}): {e}");
+                        batch_skipped += 1;
+                    }
                 }
             }
+            // Old rows are enriched in place. Pruned records are never recreated.
+            tx.execute(
+                "UPDATE proxy_request_logs SET service_tier=?2, service_tier_source=?3, reasoning_effort=?4 WHERE request_id=?1 AND data_source='codex_session'",
+                rusqlite::params![request_id, event.metadata.service_tier, event.metadata.service_tier_source, event.metadata.reasoning_effort],
+            ).map_err(|e| AppError::Database(format!("保存 Codex 请求设置失败: {e}")))?;
+            crate::proxy::usage::fast_pricing::repair(&tx, Some(&request_id))?;
         }
         if is_last_batch {
             // 游标推进与最后一批数据同事务提交：中途崩溃时两者一起回滚，
             // 不会出现"游标已推进但数据缺失"的丢数据窗口。
-            update_sync_state_on_conn(&tx, &file_path_str, file_modified, parsed.line_offset)?;
+            update_codex_sync_state(
+                &tx,
+                &file_path_str,
+                file_modified,
+                parsed.line_offset,
+                file_size,
+            )?;
         }
         tx.commit()
             .map_err(|e| AppError::Database(format!("提交 Codex 会话写入事务失败: {e}")))?;
@@ -1342,9 +1479,34 @@ fn sync_single_codex_file(
     }
 
     if to_insert.is_empty() {
-        update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        let conn = lock_conn!(db.conn);
+        update_codex_sync_state(
+            &conn,
+            &file_path_str,
+            file_modified,
+            parsed.line_offset,
+            file_size,
+        )?;
     }
     Ok(result)
+}
+
+// Codex still replays the file to reconstruct cumulative counters; the byte
+// count is only a change detector, not a seek offset.
+fn update_codex_sync_state(
+    conn: &rusqlite::Connection,
+    path: &str,
+    modified: i64,
+    lines: i64,
+    size: u64,
+) -> Result<(), AppError> {
+    update_sync_state_on_conn(conn, path, modified, lines)?;
+    conn.execute(
+        "UPDATE session_log_sync SET last_byte_offset=?2, codex_metadata_version=1 WHERE file_path=?1",
+        rusqlite::params![path, i64::try_from(size).ok()],
+    )
+    .map_err(|e| AppError::Database(format!("保存 Codex 文件大小失败: {e}")))?;
+    Ok(())
 }
 
 /// 插入单条 Codex 会话记录到 proxy_request_logs（自取锁的便捷包装，测试专用；
@@ -1653,6 +1815,237 @@ mod tests {
             .collect::<Vec<_>>();
         let mut pass = CodexSyncPass::load(db)?;
         sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass)
+    }
+
+    #[test]
+    fn metadata_tracks_turns_and_backfills_without_reimporting_history() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        let settings = |thread: &str, tier: serde_json::Value, effort: &str| {
+            serde_json::json!({
+                "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_id": thread,
+                    "thread_settings": {"service_tier": tier, "reasoning_effort": effort}}
+            })
+        };
+        let context = |effort: serde_json::Value| {
+            serde_json::json!({
+                "type": "turn_context", "payload": {"model": "gpt-5.6-sol", "effort": effort}
+            })
+        };
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 20, 10),
+                settings(PARENT_ID, serde_json::json!("priority"), "high"),
+                context(serde_json::json!("xhigh")),
+                token_count(200, 40, 20),
+                settings(CHILD_A_ID, serde_json::json!("default"), "low"),
+                context(serde_json::json!("max")),
+                token_count(300, 60, 30),
+                settings(PARENT_ID, serde_json::Value::Null, "low"),
+                context(serde_json::Value::Null),
+                token_count(400, 80, 40),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 4);
+        let rows = || -> Result<Vec<(Option<String>, Option<String>, Option<String>)>, AppError> {
+            let conn = lock_conn!(db.conn);
+            let mut stmt = conn.prepare("SELECT service_tier, service_tier_source, reasoning_effort FROM proxy_request_logs ORDER BY request_id")?;
+            let result = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(result)
+        };
+        let expected = vec![
+            (None, None, None),
+            (
+                Some("priority".into()),
+                Some("request".into()),
+                Some("xhigh".into()),
+            ),
+            (
+                Some("priority".into()),
+                Some("request".into()),
+                Some("max".into()),
+            ),
+            (None, None, None),
+        ];
+        assert_eq!(rows()?, expected);
+        let snapshot = || -> Result<Vec<(String, i64, i64, String, i64)>, AppError> {
+            let conn = lock_conn!(db.conn);
+            let mut stmt = conn.prepare("SELECT request_id, input_tokens, output_tokens, total_cost_usd, created_at FROM proxy_request_logs ORDER BY request_id")?;
+            let result = stmt
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(result)
+        };
+        let before = snapshot()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute("UPDATE proxy_request_logs SET service_tier=NULL, service_tier_source=NULL, reasoning_effort=NULL", [])?;
+            conn.execute("UPDATE session_log_sync SET codex_metadata_version=0", [])?;
+        }
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        assert_eq!(snapshot()?, before);
+        assert_eq!(rows()?, expected);
+        {
+            let conn = lock_conn!(db.conn);
+            // A completed metadata pass does not rescan an unchanged file.
+            conn.execute("UPDATE proxy_request_logs SET reasoning_effort=NULL", [])?;
+        }
+        sync_test_file(&db, &file, &[&file])?;
+        assert!(rows()?.iter().all(|r| r.2.is_none()));
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "DELETE FROM proxy_request_logs WHERE request_id LIKE '%:4'",
+                [],
+            )?;
+            conn.execute("UPDATE session_log_sync SET codex_metadata_version=0", [])?;
+        }
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        assert_eq!(
+            rows()?.len(),
+            3,
+            "metadata backfill must not resurrect pruned usage"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_with_unchanged_mtime_is_imported_once() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        let initial = [
+            session_meta(PARENT_ID),
+            turn_context(),
+            token_count(100, 50, 10),
+        ];
+        write_jsonl(&file, &initial);
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let mut appended = initial.to_vec();
+        appended.push(token_count(200, 100, 20));
+        write_jsonl(&file, &appended);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        // Old installations stored only mtime/line count. Rescan without
+        // duplicating existing rows and populate the new change detector.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE session_log_sync SET last_byte_offset=NULL", [])?;
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        let size: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT last_byte_offset FROM session_log_sync WHERE file_path=?1",
+            [file.to_string_lossy().as_ref()],
+            |r| r.get(0),
+        )?;
+        assert_eq!(size as u64, fs::metadata(&file).unwrap().len());
+        Ok(())
+    }
+
+    /// revert 产生的替换 rollout 是 `<threadId>_<rolloutId>` 双段文件名，
+    /// root meta 的 id 是原线程 ID（第一个 UUID）、forked_from_id 为空。
+    /// 旧校验只认末尾 UUID，会把这类文件永久 deferred，其后 resume 追加
+    /// 的用量全部丢失。
+    #[test]
+    fn test_resumed_rollout_meta_id_matching_leading_uuid_is_not_deferred() -> Result<(), AppError>
+    {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join(format!(
+            "rollout-2026-08-26T17-18-13-{PARENT_ID}_{CHILD_A_ID}.jsonl"
+        ));
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(100, 50, 20, "2026-08-26T09:18:20Z"),
+            ],
+        );
+
+        let parsed = parse_codex_file(&file, thread_id_from_filename(&file))?;
+
+        // 恢复会话没有显式 parent，不应因 ID 不一致被拒
+        assert!(
+            !matches!(parsed.parent, ParentResolution::Deferred(_)),
+            "恢复会话不应被 deferred，实际: {:?}",
+            parsed.parent
+        );
+        assert_eq!(parsed.root_thread_id.as_deref(), Some(CHILD_A_ID));
+        assert!(parsed.has_billable_tokens);
+        Ok(())
+    }
+
+    /// 完整同步链路下双段 rollout 的两个 UUID 分工：request_id 用尾部
+    /// rollout ID（event_index 按物理文件计数，去重键不能换），库里
+    /// session_id 记前置线程 ID，与会话管理器侧的会话身份同口径。
+    #[test]
+    fn test_resumed_rollout_session_id_uses_leading_thread_id() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = temp.path().join(format!(
+            "rollout-2026-08-26T17-18-13-{PARENT_ID}_{CHILD_A_ID}.jsonl"
+        ));
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+            ],
+        );
+
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+
+        let conn = lock_conn!(db.conn);
+        let (request_id, session_id) = conn
+            .prepare(
+                "SELECT request_id, session_id FROM proxy_request_logs
+                 WHERE data_source = 'codex_session'",
+            )?
+            .query_row([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+        assert_eq!(
+            request_id,
+            format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")
+        );
+        assert_eq!(session_id, PARENT_ID);
+        Ok(())
+    }
+
+    /// 单段文件名的不一致仍要拒收。
+    #[test]
+    fn test_single_uuid_filename_meta_mismatch_still_deferred() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        // meta 里写的是另一个线程的 ID —— 这不是 revert 双段文件名能解释的形态
+        write_jsonl(
+            &file,
+            &[
+                session_meta(CHILD_B_ID),
+                turn_context(),
+                token_count_at(1, 1, 1, "2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        let parsed = parse_codex_file(&file, thread_id_from_filename(&file))?;
+        assert!(matches!(parsed.parent, ParentResolution::Deferred(_)));
+        Ok(())
     }
 
     #[test]
@@ -2239,6 +2632,119 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(usage, (300, 150, 50));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_spawn_after_parent_resume_uses_logical_thread_history() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let old = rollout_path(temp.path(), PARENT_ID);
+        let resumed = temp.path().join(format!(
+            "rollout-2026-07-10T03-00-04-{PARENT_ID}_{CHILD_B_ID}.jsonl"
+        ));
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &old,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, None, Some(PARENT_ID), "2026-07-10T03:00:05Z"),
+                turn_context_for_model_at("gpt-5.6-luna", "2026-07-10T03:00:05Z"),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(300, 150, 30, "2026-07-10T03:00:07Z"),
+            ],
+        );
+        assert!(sync_test_file(&db, &child, &[&old, &child])?.deferred);
+        write_jsonl(
+            &resumed,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        let result = sync_test_file(&db, &child, &[&old, &resumed, &child])?;
+        assert!(!result.deferred);
+        assert_eq!((result.imported, result.skipped), (1, 1));
+        let conn = lock_conn!(db.conn);
+        let row: (String, String, i64, i64) = conn.query_row(
+            "SELECT model,session_id,input_tokens,output_tokens FROM proxy_request_logs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row, ("gpt-5.6-luna".into(), CHILD_A_ID.into(), 200, 20));
+        drop(conn);
+        assert_eq!(
+            sync_test_file(&db, &child, &[&old, &resumed, &child])?.imported,
+            0
+        );
+        // Two histories that cover the cutoff but disagree remain deferred.
+        write_jsonl(
+            &old,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(999, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        assert!(resolve_parent_signatures(
+            PARENT_ID,
+            parse_timestamp(Some(&serde_json::json!("2026-07-10T03:00:05Z"))).unwrap(),
+            &build_rollout_index(&[old, resumed])
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a sanitized local spawned-session fixture"]
+    fn local_spawned_session_fixture() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let root =
+            PathBuf::from(std::env::var("CC_SWITCH_SPAWN_FIXTURE").expect("fixture directory"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        let files = collect_codex_session_files(&root);
+        let index = build_rollout_index(&files);
+        let db = Database::memory()?;
+        let mut pass = CodexSyncPass::load(&db)?;
+        for child in manifest.as_array().unwrap() {
+            let path = root.join("sessions").join(child["file"].as_str().unwrap());
+            let result = sync_single_codex_file(&db, &path, &index, &mut pass)?;
+            assert!(!result.deferred);
+            assert!(result.imported > 0);
+            let conn = lock_conn!(db.conn);
+            let totals: (String, i64, i64, i64, i64) = conn.query_row(
+                "SELECT MIN(model),COUNT(*),SUM(input_tokens),SUM(cache_read_tokens),SUM(output_tokens) FROM proxy_request_logs WHERE session_id=?1",
+                [child["id"].as_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+            assert_eq!(totals.0, child["model"].as_str().unwrap());
+            assert_eq!(
+                (totals.2, totals.3, totals.4),
+                (
+                    child["input"].as_i64().unwrap(),
+                    child["cached"].as_i64().unwrap(),
+                    child["output"].as_i64().unwrap()
+                )
+            );
+            println!(
+                "spawn fixture: model={} rows={} input={} cached={} output={}",
+                totals.0, totals.1, totals.2, totals.3, totals.4
+            );
+            drop(conn);
+            let mut repeat = CodexSyncPass::load(&db)?;
+            assert_eq!(
+                sync_single_codex_file(&db, &path, &index, &mut repeat)?.imported,
+                0
+            );
+        }
         Ok(())
     }
 

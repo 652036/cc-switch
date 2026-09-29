@@ -41,7 +41,8 @@ mod usage_script;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use codex_config::{
-    get_codex_auth_path, get_codex_config_path, read_codex_live_settings, write_codex_live_atomic,
+    extract_codex_experimental_bearer_token, get_codex_auth_path, get_codex_config_path,
+    read_codex_live_settings, write_codex_live_atomic,
 };
 pub use commands::open_provider_terminal;
 pub use commands::*;
@@ -49,7 +50,7 @@ pub use config::{get_claude_mcp_path, get_claude_settings_path, read_json_file};
 pub use database::{Database, Profile};
 pub use deeplink::{import_provider_from_deeplink, parse_deeplink_url, DeepLinkImportRequest};
 pub use error::AppError;
-pub use grok_config::get_grok_config_path;
+pub use grok_config::{get_grok_auth_path, get_grok_config_path, write_grok_live_atomic};
 pub use mcp::{
     import_from_claude, import_from_codex, import_from_gemini, import_from_grokbuild,
     remove_server_from_claude, remove_server_from_codex, remove_server_from_gemini,
@@ -501,10 +502,12 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
 
-            // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
+            // Only register the updater when this build has an update feed.
             #[cfg(desktop)]
             {
-                if let Err(e) = app
+                if !commands::app_updates_enabled(app.handle()) {
+                    log::info!("Application update checks are disabled for this build.");
+                } else if let Err(e) = app
                     .handle()
                     .plugin(tauri_plugin_updater::Builder::new().build())
                 {
@@ -559,37 +562,8 @@ pub fn run() {
             // 现在创建数据库（包含 Schema 迁移）
             //
             // 说明：从 v3.8.* 升级的用户通常会走到这里的 SQLite schema 迁移，
-            // 若迁移失败（数据库损坏/权限不足/user_version 过新等），需要给用户明确提示，
+            // 若迁移失败（数据库损坏/权限不足等），需要给用户明确提示，
             // 否则表现可能只是“应用打不开/闪退”。
-            //
-            // 预检：数据库版本过新时，必须先于任何 schema 写操作（create_tables 内含
-            // DROP/ALTER 等 DDL）进入恢复界面，避免旧应用对读不懂的更新版 DB 落写。
-            match crate::database::Database::stored_user_version_exceeds_supported(&db_path) {
-                Ok(Some(version)) => {
-                    log::warn!("数据库版本过新（v{version}），引导用户在应用内升级应用");
-                    crate::init_status::set_init_error(crate::init_status::InitErrorPayload {
-                        path: db_path.display().to_string(),
-                        error: format!(
-                            "数据库版本过新（{version}），当前应用仅支持 {}，请升级应用后再尝试。",
-                            crate::database::SCHEMA_VERSION
-                        ),
-                        kind: Some("db_version_too_new".to_string()),
-                        db_version: Some(version),
-                        supported_version: Some(crate::database::SCHEMA_VERSION),
-                    });
-                    // 主窗口默认 visible:false，恢复界面必须强制显示
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("预检数据库版本失败，继续正常初始化流程: {e}");
-                }
-            }
-
             let db = loop {
                 match crate::database::Database::init() {
                     Ok(db) => break Arc::new(db),
@@ -1080,6 +1054,12 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
                 .tooltip("CC Switch") // 鼠标悬停提示
                 .on_tray_icon_event(|tray, event| match event {
+                    TrayIconEvent::DoubleClick {
+                        button: tauri::tray::MouseButton::Left,
+                        ..
+                    } => {
+                        tray::handle_tray_menu_event(tray.app_handle(), "show_main");
+                    }
                     // 鼠标悬停/点击到托盘图标时，后台异步刷新用量缓存，
                     // 让用户下一次（或快速打开菜单的那一刻）看到较新的数字。
                     // refresh_all_usage_in_tray 内部有 10 秒防抖。
@@ -1238,6 +1218,11 @@ pub fn run() {
 
                 initialize_common_config_snippets(&state);
 
+                // Opt-in loopback receiver for Codex ephemeral-session usage.
+                tauri::async_runtime::spawn(crate::services::codex_otel::serve_if_configured(
+                    state.db.clone(),
+                ));
+
                 // 检查 settings 表中的代理状态，自动恢复代理服务
                 restore_proxy_state_on_startup(&state).await;
 
@@ -1262,12 +1247,15 @@ pub fn run() {
                     }
                 });
 
-                // Session log usage sync: 启动时同步一次，之后每 60 秒检查
+                // Session scans follow the dashboard's saved refresh interval and auto-scan switch.
                 let db_for_session_sync = state.db.clone();
                 tauri::async_runtime::spawn(async move {
-                    const SESSION_SYNC_INTERVAL_SECS: u64 = 60;
-
                     async fn run_session_sync(db: std::sync::Arc<crate::database::Database>, backfill: bool) {
+                        // 手动扫描模式下跳过定时扫描；backfill 轮（启动首轮）仍进入，
+                        // 费用回填只修补数据库既有行（含代理记账行），不读会话文件
+                        if !backfill && crate::settings::session_sync_interval_ms(&crate::settings::get_settings()).is_none() {
+                            return;
+                        }
                         let _guard = crate::services::session_usage::session_sync_mutex()
                             .lock()
                             .await;
@@ -1276,6 +1264,9 @@ pub fn run() {
                                 if let Err(error) = db.backfill_missing_usage_costs() {
                                     log::warn!("Usage cost startup backfill failed: {error}");
                                 }
+                            }
+                            if crate::settings::session_sync_interval_ms(&crate::settings::get_settings()).is_none() {
+                                return crate::services::session_usage::SessionSyncResult::default();
                             }
                             crate::services::session_usage::sync_all_unlocked(&db)
                         });
@@ -1294,15 +1285,17 @@ pub fn run() {
                     // 首次同步（含费用回填）
                     run_session_sync(db_for_session_sync.clone(), true).await;
 
-                    // 定期同步
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                        SESSION_SYNC_INTERVAL_SECS,
-                    ));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    interval.tick().await; // skip immediate first tick
+                    let mut last_scan = std::time::Instant::now();
                     loop {
-                        interval.tick().await;
-                        run_session_sync(db_for_session_sync.clone(), false).await;
+                        // Re-read settings so cadence changes and Off take effect without restart.
+                        // This checks settings only; it does not scan files every second.
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if let Some(ms) = crate::settings::session_sync_interval_ms(&crate::settings::get_settings()) {
+                            if last_scan.elapsed() >= std::time::Duration::from_millis(ms) {
+                                last_scan = std::time::Instant::now();
+                                run_session_sync(db_for_session_sync.clone(), false).await;
+                            }
+                        }
                     }
                 });
             });
@@ -1660,6 +1653,7 @@ pub fn run() {
             // Generic managed auth commands
             commands::auth_start_login,
             commands::auth_poll_for_account,
+            commands::auth_cancel_login,
             commands::auth_list_accounts,
             commands::auth_get_status,
             commands::auth_remove_account,

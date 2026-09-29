@@ -56,6 +56,21 @@
     "hide": "Hide API Key"
   },
   "jsonEditor": {
+    "search": {
+      "find": "Find",
+      "replaceWith": "Replace with",
+      "next": "Next",
+      "previous": "Previous",
+      "selectAll": "Select all matches",
+      "matchCase": "Match case",
+      "regexp": "Regular expression",
+      "wholeWord": "Whole word",
+      "replace": "Replace",
+      "replaceAll": "Replace all",
+      "close": "Close search",
+      "currentMatch": "Current match",
+      "onLine": "on line"
+    },
     "mustBeObject": "Configuration must be a JSON object, not an array or other type",
     "invalidJson": "Invalid JSON format"
   },
@@ -288,6 +303,7 @@
     "openclawNoModels": "No models configured",
     "openclawModelNotFound": "The selected model no longer exists. Refresh and try again.",
     "backfillWarning": "Switched successfully, but failed to save changes back to the previous provider",
+    "codexAuthCleanupFailed": "Switched successfully, but auth.json could not be removed — the official login credentials are still on disk; delete auth.json from the Codex config directory to remove them",
     "windowControlFailed": "Window control failed: {{error}}",
     "officialBlockedByProxy": "Cannot switch to official provider while local routing is active. Using routing with official APIs may cause account bans.",
     "proxyOfficialWarning": "Current provider {{name}} is official. Consider switching to a third-party provider before using local routing.",
@@ -751,6 +767,7 @@
           "alacritty": "Alacritty",
           "kitty": "Kitty",
           "ghostty": "Ghostty",
+          "otty": "Otty",
           "wezterm": "WezTerm",
           "kaku": "Kaku",
           "warp": "Warp"
@@ -802,6 +819,7 @@
     "browseDirectory": "Browse Directory",
     "resetDefault": "Reset to default directory (takes effect after saving)",
     "checkForUpdates": "Check for Updates",
+    "appUpdatesDisabled": "App updates disabled",
     "updateTo": "Update to v{{version}}",
     "updating": "Updating...",
     "checking": "Checking...",
@@ -1062,6 +1080,10 @@
     "profile": "Client model profile",
     "rawConfig": "config.toml",
     "invalidToml": "Invalid config.toml: {{error}}",
+    "authJson": "auth.json (JSON)",
+    "authJsonPlaceholder": "{\n  \"https://auth.x.ai::<client-id>\": {\n    \"key\": \"...\",\n    \"refresh_token\": \"...\",\n    \"email\": \"you@example.com\"\n  }\n}",
+    "authJsonError": "auth.json format error, please check JSON syntax",
+    "authJsonRequired": "auth.json must be a JSON object",
     "defaultModelPlaceholder": "e.g. grok-4.5",
     "defaultModelHint": "The model Grok Build requests by default; change it anytime without waiting for a preset update.",
     "advancedSectionHint": "Includes upstream format, reasoning overrides and custom User-Agent. Providers using the Chat Completions or Anthropic Messages protocol require routing takeover to be enabled.",
@@ -1234,7 +1256,8 @@
       "zetaapi": "ZetaAPI delivers real, undegraded models at as low as 35% of official pricing. Exclusive CC Switch offer: register via this link and use promo code CC-SWITCH for 10% off your first top-up!",
       "teamorouter": "TeamoRouter is an enterprise-grade Agentic LLM gateway with pricing up to 90% off. It offers exclusive benefits for CC Switch users: register via this link as a new user for 10% off your first top-up!",
       "ppio": "PPIO is a leading independent Agentic Cloud provider in China, serving every flagship open-source model through a single API key. Register via this link and complete identity verification to receive a ¥10 credit voucher.",
-      "xycai": "XycAi is an enterprise-grade token factory: one-click access to 200+ global models, automatic SLA compensation, and 100% refunds for abnormal cache charges!"
+      "xycai": "XycAi is an enterprise-grade token factory: one-click access to 200+ global models, automatic SLA compensation, and 100% refunds for abnormal cache charges!",
+      "9527code": "9527 CODE is an enterprise-grade, full-capability AI relay platform delivering fast, stable relay for Claude Code, Codex and other mainstream models. One year of continuous operation, 99.9% service stability, and 7×24 human technical support. New users can contact support for trial credit, with unlimited referral cashback!"
     },
     "presets": {
       "ucloud": "Compshare",
@@ -1419,6 +1442,7 @@
     "reauthLogin": "Re-login",
     "reauthSelectHint": "This account needs to sign in again to enable managed binding.",
     "reauthNow": "Re-login now",
+    "duplicateAccount": "This ChatGPT account has already been added. Use the existing account.",
     "loggedInAccounts": "Logged in accounts",
     "defaultAccount": "Default",
     "selected": "Selected",
@@ -1662,6 +1686,13 @@
     "noSearchResults": "No provider presets match your search."
   },
   "usage": {
+    "serviceTier": "Mode",
+    "reasoningEffort": "Reasoning effort",
+    "metadataUnknown": "Unknown",
+    "standardTier": "Standard",
+    "autoTier": "Auto",
+    "tierRequest": "Request setting",
+    "tierResponse": "Response",
     "title": "Usage Statistics",
     "subtitle": "View AI model usage and cost statistics",
     "today": "24 Hours",
@@ -1719,6 +1750,13 @@
       "pi": "Pi"
     },
     "rawInputLabel": "Raw",
+    "sessionSync": {
+      "title": "Auto-Scan Session Logs",
+      "description": "Scans session logs at the refresh interval selected above. Turning off auto-scan or the refresh interval leaves manual sync available.",
+      "syncNow": "Sync Now",
+      "syncCompleted": "Sync completed: {{imported}} imported, {{files}} files scanned, {{errors}} errors",
+      "syncFailed": "Session usage sync failed: {{error}}"
+    },
     "rebuildCodex": {
       "title": "Codex Usage Maintenance",
       "description": "Rebuild Codex session usage from local rollout logs",
@@ -1792,12 +1830,16 @@
     "tokenUsage": "Token Usage",
     "cacheCreationCost": "Cache Creation Cost",
     "costBreakdown": "Cost Breakdown",
+    "costBreakdownUnavailable": "The log provides only the total cost; component costs and rates are unavailable.",
+    "costBreakdownMismatch": "Component costs do not reconcile with the total. The recorded total is shown below.",
+    "fastPricingUnavailable": "Fast pricing is unavailable for this model. Showing configured base rates.",
     "performance": "Performance",
     "latency": "Latency",
     "errorMessage": "Error Message",
     "requests": "Requests",
     "tokens": "Tokens",
     "avgCost": "Average Cost",
+    "avgCostPerMillion": "Average cost per million tokens (including cache)",
     "avgLatency": "Average Latency",
     "successRate": "Success Rate",
     "requestId": "Request ID",
@@ -1954,6 +1996,7 @@
     "tip3": "• Entire config must be wrapped in () to form object literal expression"
   },
   "dbUpgrade": {
+    "updatesDisabledDescription": "This database requires a newer compatible version. App updates are disabled in this build. Back up the database and manually install a compatible custom build.",
     "title": "Database version is too new",
     "description": "This database was created by a newer version of CC Switch. Upgrade the app to continue. Upgrading will not delete your data.",
     "versionInfo": "Database v{{db}} · App supports v{{supported}}",
@@ -2190,6 +2233,7 @@
     }
   },
   "profiles": {
+    "switcherAriaLabel": "Project: {{name}}",
     "switcherTooltip": {
       "claude": "Projects: switch the Claude Code provider / MCP / Skills / memory files in one click",
       "claude-desktop": "Projects: switch the Claude Desktop provider in one click",
@@ -2873,6 +2917,7 @@
     },
     "switchFailed": "Switch failed: {{error}}",
     "takeover": {
+      "ariaLabel": "{{appLabel}} local routing",
       "hint": "Select apps to route — once enabled, requests from that app will go through local routing",
       "enabled": "{{app}} routing enabled",
       "disabled": "{{app}} routing disabled",

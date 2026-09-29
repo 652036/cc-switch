@@ -8,7 +8,7 @@
  * 收录规则：
  * - 不含官方 / 托管 OAuth 预设：Grok CLI 自带 xAI 订阅登录，官方态走
  *   独立的 "Grok Official" 条目（对应 providers_seed.rs 的 seed，
- *   空 config = 不写自定义模型表）。
+ *   空 config = 不写自定义模型表；auth.json 按账号存在 settings.auth）。
  * - 不含国产模型官方直连（cn_official）与纯开源模型托管站
  *   （SiliconFlow / ModelScope / Novita / Nvidia / AtlasCloud）：
  *   这些上游没有 Grok 模型，无法在 Grok CLI 中使用。
@@ -43,8 +43,8 @@ export interface GrokBuildProviderPreset {
 }
 
 // 官方条目与后端 seed（providers_seed.rs 的 "Grok Official"）对应：
-// 空 config = 不写自定义模型表，Grok CLI 回落到自带的 xAI OAuth 登录。
-// 预设 id 复用固定 provider id，AddProviderDialog 据此走 ensure seed 流程。
+// 空 config = 不写自定义模型表；空 auth 在 grok login 后由切换回填保存。
+// 再选一次该预设会新增一张官方卡片，用于第二个 Grok 账号。
 export const grokBuildOfficialPreset: GrokBuildProviderPreset = {
   name: "Grok Official",
   websiteUrl: "https://x.ai/grok",
@@ -253,6 +253,22 @@ export const grokBuildProviderPresets: GrokBuildProviderPreset[] = [
     icon: "apikeyfun",
   },
   {
+    name: "9527CODE",
+    websiteUrl: "https://9527.codes",
+    apiKeyUrl: "https://9527.codes/register?aff=e5zI",
+    auth: grokAuth(),
+    config: grokPresetConfig("9527CODE", "https://9527.codes/v1"),
+    endpointCandidates: [
+      "https://9527.codes/v1",
+      "https://api.9527.codes/v1",
+      "https://cdn.9527.codes/v1",
+    ],
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "9527code",
+    icon: "9527code",
+  },
+  {
     name: "Code0",
     websiteUrl: "https://code0.ai",
     apiKeyUrl: "https://code0.ai/agent/register/B2XHxGjGmRvqgznY",
@@ -266,12 +282,15 @@ export const grokBuildProviderPresets: GrokBuildProviderPreset[] = [
   },
   {
     name: "TeamoRouter",
-    websiteUrl: "https://teamorouter.com",
+    websiteUrl: "https://teamorouter.cn",
     apiKeyUrl:
-      "https://teamorouter.com/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory",
+      "https://teamorouter.cn/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory",
     auth: grokAuth(),
-    config: grokPresetConfig("TeamoRouter", "https://api.teamorouter.com/v1"),
-    endpointCandidates: ["https://api.teamorouter.com/v1"],
+    config: grokPresetConfig("TeamoRouter", "https://api.teamorouter.cn/v1"),
+    endpointCandidates: [
+      "https://api.teamorouter.cn/v1",
+      "https://api.teamorouter.com/v1",
+    ],
     category: "aggregator",
     isPartner: true,
     partnerPromotionKey: "teamorouter",
