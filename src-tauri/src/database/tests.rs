@@ -202,16 +202,15 @@ fn schema_migration_sets_user_version_when_missing() {
 }
 
 #[test]
-fn schema_migration_rejects_future_version() {
+fn schema_migration_tolerates_future_version() {
     let conn = Connection::open_in_memory().expect("open memory db");
     Database::create_tables_on_conn(&conn).expect("create tables");
     Database::set_user_version(&conn, SCHEMA_VERSION + 1).expect("set future version");
 
-    let err =
-        Database::apply_schema_migrations_on_conn(&conn).expect_err("should reject higher version");
-    assert!(
-        err.to_string().contains("数据库版本过新"),
-        "unexpected error: {err}"
+    Database::apply_schema_migrations_on_conn(&conn).expect("should skip migration");
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version"),
+        SCHEMA_VERSION + 1
     );
 }
 

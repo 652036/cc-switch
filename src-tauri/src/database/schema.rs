@@ -463,12 +463,11 @@ impl Database {
 
         let mut version = Self::get_user_version(conn)?;
 
+        // 数据库版本高于应用支持的版本时不再拒绝启动：跳过迁移并保留原 user_version。
         if version > SCHEMA_VERSION {
-            conn.execute("ROLLBACK TO schema_migration;", []).ok();
-            conn.execute("RELEASE schema_migration;", []).ok();
-            return Err(AppError::Database(format!(
-                "数据库版本过新（{version}），当前应用仅支持 {SCHEMA_VERSION}，请升级应用后再尝试。"
-            )));
+            log::warn!(
+                "数据库版本（v{version}）高于应用支持的版本（v{SCHEMA_VERSION}），跳过迁移并继续使用"
+            );
         }
 
         let result = (|| {
